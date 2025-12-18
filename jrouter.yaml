@@ -51,6 +51,12 @@ ethertalk:
     net_start: 100
     net_end: 100
 
+# locatalk (LocalTalk over UDP)
+# For use with emulators Like Snow, Minivmac, or hardware like TashTalk.
+#localtalk:
+#  - network: 100
+#    zone_name: The Twilight Zone
+
 # open_peering lets the server accept incoming connections from unknown servers.
 # If you disable this, only the configured peers will be connected.
 # For now I recommend enabling this.

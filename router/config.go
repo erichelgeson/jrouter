@@ -44,11 +44,9 @@ type Config struct {
 	// EtherTalk is required for routing one or more local EtherTalk networks.
 	EtherTalk EtherTalkConfigs `yaml:"ethertalk"`
 
-	// LocalTalk is TODO.
-	// LocalTalk struct {
-	//	ZoneName   string `yaml:"zone_name"`
-	// 	Network uint16 `yaml:"network"`
-	// } `yaml:"localtalk"`
+	// LocalTalk configures LocalTalk over UDP (LTOU).
+	// This enables communication with LocalTalk devices via UDP multicast.
+	LocalTalk LocalTalkConfigs `yaml:"localtalk"`
 
 	// OpenPeering allowsrouters other than those listed under peers.
 	OpenPeering bool `yaml:"open_peering"`
@@ -114,6 +112,46 @@ type EtherTalkConfig struct {
 	NetEnd   ddp.Network `yaml:"net_end"`
 }
 
+type LocalTalkConfigs []*LocalTalkConfig
+
+func (cs *LocalTalkConfigs) UnmarshalYAML(n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.SequenceNode:
+		return n.Decode((*[]*LocalTalkConfig)(cs))
+
+	case yaml.MappingNode:
+		var v LocalTalkConfig
+		if err := n.Decode(&v); err != nil {
+			return err
+		}
+		*cs = append(*cs, &v)
+		return nil
+
+	default:
+		return fmt.Errorf("invalid YAML kind for 'localtalk' %v, want either a sequence or a mapping", n.Kind)
+	}
+}
+
+// LocalTalkConfig configures LocalTalk over UDP (LTOU).
+type LocalTalkConfig struct {
+	// Network is the AppleTalk network number for this LocalTalk network.
+	// LocalTalk networks are non-extended (single network, not a range).
+	// Required.
+	Network ddp.Network `yaml:"network"`
+
+	// ZoneName is the AppleTalk zone name for the network. Required.
+	ZoneName string `yaml:"zone_name"`
+
+	// InterfaceAddr optionally specifies which network interface to use
+	// for UDP multicast. Default: "0.0.0.0" (all interfaces).
+	InterfaceAddr string `yaml:"interface_addr"`
+
+	// PreferredNode optionally specifies a preferred node ID (1-254).
+	// The router will attempt to acquire this node ID first.
+	// Default: 254
+	PreferredNode uint8 `yaml:"preferred_node"`
+}
+
 // LoadConfig readand parses a configuration file, and sets some defaults.
 func LoadConfig(cfgPath string) (*Config, error) {
 	f, err := os.Open(cfgPath)
@@ -156,6 +194,26 @@ func LoadConfig(cfgPath string) (*Config, error) {
 			if zn == "" || zn == "*" {
 				validationErrs = append(validationErrs, fmt.Errorf("port %q zone name %q is invalid; cannot be empty or *", port.Device, port.DefaultZoneName))
 			}
+		}
+	}
+
+	// Check LocalTalk configs
+	for i, ltcfg := range c.LocalTalk {
+		// Network must be non-zero
+		if ltcfg.Network == 0 {
+			validationErrs = append(validationErrs, fmt.Errorf("localtalk[%d] network must be non-zero", i))
+		}
+		// Zone name must be 32 characters or fewer
+		if len(ltcfg.ZoneName) > 32 {
+			validationErrs = append(validationErrs, fmt.Errorf("localtalk[%d] zone name %q (length %d) is too long; cannot be more than 32 characters", i, ltcfg.ZoneName, len(ltcfg.ZoneName)))
+		}
+		// Zone name must not be empty or '*'
+		if ltcfg.ZoneName == "" || ltcfg.ZoneName == "*" {
+			validationErrs = append(validationErrs, fmt.Errorf("localtalk[%d] zone name %q is invalid; cannot be empty or *", i, ltcfg.ZoneName))
+		}
+		// PreferredNode must be 0 (default) or 1-254
+		if ltcfg.PreferredNode > 254 {
+			validationErrs = append(validationErrs, fmt.Errorf("localtalk[%d] preferred_node %d is invalid; must be 0 (default) or 1-254", i, ltcfg.PreferredNode))
 		}
 	}
 

@@ -132,23 +132,25 @@ func (r *Router) AURPInput(ctx context.Context, logger *slog.Logger, wg *sync.Wa
 				logger.Error("AURP: Couldn't unmarshal encapsulated DDP packet", "error", err)
 				continue
 			}
-			// logger.Debug(fmt.Sprintf("DDP/AURP: Got %d.%d.%d -> %d.%d.%d proto %d data len %d",
-			// 	ddpkt.SrcNet, ddpkt.SrcNode, ddpkt.SrcSocket,
-			// 	ddpkt.DstNet, ddpkt.DstNode, ddpkt.DstSocket,
-			// 	ddpkt.Proto, len(ddpkt.Data)))
 
-			// Is it addressed to me?
+			// Is it addressed to me? Check both EtherTalk and LocalTalk ports.
 			var localPort *EtherTalkPort
+			var localLTPort *LocalTalkPort
 			for _, port := range r.Ports {
 				if ddpkt.DstNet >= port.netStart && ddpkt.DstNet <= port.netEnd {
 					localPort = port
 					break
 				}
 			}
-			if ddpkt.DstNode == 0 && localPort != nil { // Node 0 = any router for the network = me
+			for _, port := range r.LocalTalkPorts {
+				if ddpkt.DstNet == port.network {
+					localLTPort = port
+					break
+				}
+			}
+			if ddpkt.DstNode == 0 && (localPort != nil || localLTPort != nil) { // Node 0 = any router for the network = me
 				// Is it NBP? FwdReq needs translating.
 				if ddpkt.DstSocket != 2 {
-					logger.Debug("DDP/AURP: I don't have anything 'listening' on that socket", "dst-socket", ddpkt.DstSocket)
 					continue
 				}
 				// It's NBP, specifically it should be a FwdReq
@@ -165,7 +167,8 @@ func (r *Router) AURPInput(ctx context.Context, logger *slog.Logger, wg *sync.Wa
 			// another way, the whole network of AURP nodes acts as one huge
 			// "router".) Hence rooter.Output and not rooter.Forward.
 			if err := r.Output(ctx, ddpkt); err != nil {
-				logger.Error("DDP/AURP: Couldn't route packet", "error", err)
+				logger.Error("DDP/AURP: Couldn't route packet", "error", err,
+					"dst-net", ddpkt.DstNet, "dst-node", ddpkt.DstNode, "proto", ddpkt.Proto)
 			}
 
 		default:

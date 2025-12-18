@@ -26,11 +26,12 @@ import (
 
 // Router implements the core routing logic.
 type Router struct {
-	Logger     *slog.Logger
-	Config     *Config
-	RouteTable *RouteTable
-	Ports      []*EtherTalkPort
-	AURPPeers  *AURPPeerTable
+	Logger         *slog.Logger
+	Config         *Config
+	RouteTable     *RouteTable
+	Ports          []*EtherTalkPort
+	LocalTalkPorts []*LocalTalkPort
+	AURPPeers      *AURPPeerTable
 }
 
 // Forward increments the hop count, then outputs the packet in the direction
@@ -56,6 +57,5 @@ func (rtr *Router) Output(ctx context.Context, ddpkt *ddp.ExtPacket) error {
 	if route.Zero() {
 		return fmt.Errorf("no route for packet (dstnet %d); dropping packet", ddpkt.DstNet)
 	}
-
 	return route.Target.Forward(ctx, ddpkt)
 }

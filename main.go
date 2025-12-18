@@ -157,8 +157,8 @@ func main() {
 
 	// --------------------------------- Pcap ---------------------------------
 	//
-	if len(cfg.EtherTalk) == 0 {
-		logger.Error("The ethertalk config in jrouter.yaml was empty; at least one entry is required")
+	if len(cfg.EtherTalk) == 0 && len(cfg.LocalTalk) == 0 {
+		logger.Error("Both ethertalk and localtalk configs in jrouter.yaml were empty; at least one entry is required")
 		os.Exit(1)
 	}
 
@@ -206,6 +206,21 @@ func main() {
 			zones,
 			handle,
 		)
+	}
+
+	// ------------------------------- LocalTalk ------------------------------
+	//
+	for _, ltcfg := range cfg.LocalTalk {
+		_, err := rooter.NewLocalTalkPort(
+			ltcfg.Network,
+			ltcfg.ZoneName,
+			ltcfg.InterfaceAddr,
+			ltcfg.PreferredNode,
+		)
+		if err != nil {
+			logger.Error("Couldn't create LocalTalk port", "network", ltcfg.Network, "error", err)
+			os.Exit(1)
+		}
 	}
 
 	// -------------------------------- Peers ---------------------------------
@@ -320,6 +335,20 @@ func main() {
 		wg.Add(2)
 		go etPort.Serve(ctx, wg)
 		go etPort.Outbox(ctx, wg)
+	}
+
+	// -------------------------- Run LocalTalk ports -------------------------
+	//
+	for _, ltPort := range rooter.LocalTalkPorts {
+		ctx := ltPort.StatusCtx(ctx)
+
+		// Run node acquisition and RTMP on each port.
+		go ltPort.RunNodeAcquisition(ctx)
+		go ltPort.RunRTMP(ctx)
+
+		// Start handling packets.
+		wg.Add(1)
+		go ltPort.Serve(ctx, wg)
 	}
 
 	// ------------------------------- Run AURP -------------------------------

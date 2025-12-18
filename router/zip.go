@@ -258,8 +258,10 @@ func (port *EtherTalkPort) handleZIPTReq(ctx context.Context, ddpkt *ddp.ExtPack
 	if err != nil {
 		return err
 	}
+	// StartIndex is 1-based per spec, but some old clients send 0
+	// Treat 0 as 1 for compatibility
 	if gzl.StartIndex == 0 {
-		return fmt.Errorf("ZIP ATP: received request with StartIndex = 0 (invalid)")
+		gzl.StartIndex = 1
 	}
 
 	resp := &zip.GetZonesReplyPacket{
