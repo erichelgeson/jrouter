@@ -54,6 +54,72 @@ const (
 	ENQAttempts = 8
 )
 
+// configureMulticastSocket sets IP_MULTICAST_TTL and optionally IP_MULTICAST_IF
+// on the UDP connection. TTL=1 prevents multicast packets from leaking beyond
+// the local network. IP_MULTICAST_IF binds outbound multicast to a specific
+// interface on multi-homed hosts.
+func configureMulticastSocket(conn *net.UDPConn, intfIP net.IP, ttl int) error {
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var opErr error
+	err = rawConn.Control(func(fd uintptr) {
+		opErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_TTL, ttl)
+		if opErr != nil {
+			return
+		}
+		if intfIP != nil {
+			mreq := &syscall.IPMreq{}
+			copy(mreq.Interface[:], intfIP.To4())
+			opErr = syscall.SetsockoptIPMreq(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_IF, mreq)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	return opErr
+}
+
+// buildLocalIPSet returns the set of IPv4 addresses on all local interfaces.
+func buildLocalIPSet() (map[[4]byte]struct{}, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[[4]byte]struct{})
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipnet.IP.To4()
+		if ip4 == nil {
+			continue
+		}
+		set[[4]byte(ip4)] = struct{}{}
+	}
+	return set, nil
+}
+
+// isOwnPacket returns true if the packet was sent by this host—both the sender
+// ID must match AND the source IP must belong to a local interface.
+func (port *LocalTalkPort) isOwnPacket(senderID []byte, srcAddr *net.UDPAddr) bool {
+	if len(senderID) < 4 {
+		return false
+	}
+	if senderID[0] != port.senderID[0] || senderID[1] != port.senderID[1] ||
+		senderID[2] != port.senderID[2] || senderID[3] != port.senderID[3] {
+		return false
+	}
+	ip4 := srcAddr.IP.To4()
+	if ip4 == nil {
+		return false
+	}
+	_, ok := port.localIPs[[4]byte(ip4)]
+	return ok
+}
+
 // joinMulticastGroup joins a UDP connection to a multicast group on a specific interface.
 func joinMulticastGroup(conn *net.UDPConn, intf *net.Interface, group net.IP) error {
 	rawConn, err := conn.SyscallConn()
@@ -91,7 +157,8 @@ type LocalTalkPort struct {
 	// UDP connection
 	conn          *net.UDPConn
 	multicastAddr *net.UDPAddr
-	senderID      [4]byte // PID-based sender identification
+	senderID      [4]byte          // PID-based sender identification
+	localIPs      map[[4]byte]struct{} // Local interface IPs for own-packet detection
 
 	// Network configuration
 	network  ddp.Network // Single network number (non-extended)
@@ -184,6 +251,16 @@ func (router *Router) NewLocalTalkPort(
 	}
 	conn := pc.(*net.UDPConn)
 
+	// Configure multicast TTL and outbound interface
+	var mcastIntfIP net.IP
+	if intfAddr != "0.0.0.0" {
+		mcastIntfIP = net.ParseIP(intfAddr).To4()
+	}
+	if err := configureMulticastSocket(conn, mcastIntfIP, 1); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("configure multicast socket: %w", err)
+	}
+
 	// Join multicast group
 	if intf != nil {
 		err = joinMulticastGroup(conn, intf, multicastAddr.IP)
@@ -228,6 +305,14 @@ func (router *Router) NewLocalTalkPort(
 	// Set sender ID to PID
 	binary.BigEndian.PutUint32(port.senderID[:], uint32(os.Getpid()))
 
+	// Build local IP set for own-packet detection
+	localIPs, err := buildLocalIPSet()
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("build local IP set: %w", err)
+	}
+	port.localIPs = localIPs
+
 	// Add port to router
 	router.LocalTalkPorts = append(router.LocalTalkPorts, port)
 
@@ -263,7 +348,7 @@ func (port *LocalTalkPort) Serve(ctx context.Context, wg *sync.WaitGroup) {
 		// Set read deadline for periodic context checks
 		port.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 
-		n, _, err := port.conn.ReadFromUDP(buf)
+		n, srcAddr, err := port.conn.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
@@ -277,9 +362,8 @@ func (port *LocalTalkPort) Serve(ctx context.Context, wg *sync.WaitGroup) {
 			continue
 		}
 
-		// Filter own packets by sender ID
-		if buf[0] == port.senderID[0] && buf[1] == port.senderID[1] &&
-			buf[2] == port.senderID[2] && buf[3] == port.senderID[3] {
+		// Filter own packets by sender ID AND source IP
+		if port.isOwnPacket(buf[:4], srcAddr) {
 			continue
 		}
 
@@ -352,6 +436,11 @@ func (port *LocalTalkPort) handleDDPPacket(ctx context.Context, pkt *ddp.ExtPack
 	port.nodeMu.Unlock()
 
 	if !acquired {
+		return
+	}
+
+	// Reject packets with invalid source nodes (broadcast or any-router)
+	if pkt.SrcNode == 0x00 || pkt.SrcNode == 0xFF {
 		return
 	}
 
@@ -534,13 +623,15 @@ func (port *LocalTalkPort) Forward(ctx context.Context, pkt *ddp.ExtPacket) erro
 }
 
 // Broadcast broadcasts a DDP packet (node 0xFF).
+// Always uses short DDP (correct for non-extended LocalTalk) and does not
+// mutate the input packet.
 func (port *LocalTalkPort) Broadcast(pkt *ddp.ExtPacket) error {
 	port.nodeMu.Lock()
 	srcNode := port.myNode
 	port.nodeMu.Unlock()
 
-	pkt.DstNode = 0xFF
-	frame := llap.ExtPacketToFrame(pkt, port.network, srcNode)
+	frame := llap.ExtPacketToShortDDP(pkt, srcNode)
+	frame.DstNode = 0xFF
 	return port.sendFrame(frame)
 }
 
