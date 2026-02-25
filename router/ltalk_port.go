@@ -967,7 +967,7 @@ func (port *LocalTalkPort) handleNBPBrRq(ctx context.Context, ddpkt *ddp.ExtPack
 
 	for _, route := range routes {
 		if ltPort, isLTPort := route.Target.(*LocalTalkPort); isLTPort {
-			// Local zone - broadcast LkUp
+			// LocalTalk zone - broadcast LkUp directly
 			nbpkt.Function = nbp.FunctionLkUp
 			nbpRaw, err := nbpkt.Marshal()
 			if err != nil {
@@ -1003,6 +1003,49 @@ func (port *LocalTalkPort) handleNBPBrRq(ctx context.Context, ddpkt *ddp.ExtPack
 			if outDDP2 != nil {
 				port.logger.Debug("NBP: Replying to BrRq directly")
 				if err := port.Send(ctx, outDDP2); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+
+		if etPort, isETPort := route.Target.(*EtherTalkPort); isETPort {
+			// EtherTalk zone - zone multicast LkUp directly
+			nbpkt.Function = nbp.FunctionLkUp
+			nbpRaw, err := nbpkt.Marshal()
+			if err != nil {
+				return fmt.Errorf("couldn't marshal LkUp: %v", err)
+			}
+
+			myAddr := port.Address()
+			outDDP := ddp.ExtPacket{
+				ExtHeader: ddp.ExtHeader{
+					Size:      atalk.DDPExtHeaderSize + uint16(len(nbpRaw)),
+					Cksum:     0,
+					SrcNet:    myAddr.Network,
+					SrcNode:   myAddr.Node,
+					SrcSocket: 2,
+					DstNet:    0x0000,
+					DstNode:   0xFF,
+					DstSocket: 2,
+					Proto:     ddp.ProtoNBP,
+				},
+				Data: nbpRaw,
+			}
+
+			port.logger.Debug("NBP: zone multicasting LkUp to EtherTalk", "tuple", tuple)
+			if err := etPort.ZoneMulticast(tuple.Zone, &outDDP); err != nil {
+				return err
+			}
+
+			// Also reply if the EtherTalk port matches
+			outDDP2, err := etPort.helloWorldThisIsMe(nbpkt.NBPID, tuple)
+			if err != nil {
+				return err
+			}
+			if outDDP2 != nil {
+				port.logger.Debug("NBP: EtherTalk port replying to BrRq directly")
+				if err := port.router.Output(ctx, outDDP2); err != nil {
 					return err
 				}
 			}
