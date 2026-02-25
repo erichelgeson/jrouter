@@ -130,6 +130,49 @@ func (port *EtherTalkPort) handleNBPBrRq(ctx context.Context, ddpkt *ddp.ExtPack
 			continue
 		}
 
+		if ltPort, isLTPort := route.Target.(*LocalTalkPort); isLTPort {
+			// LocalTalk zone - broadcast LkUp directly
+			nbpkt.Function = nbp.FunctionLkUp
+			nbpRaw, err := nbpkt.Marshal()
+			if err != nil {
+				return fmt.Errorf("couldn't marshal LkUp: %v", err)
+			}
+
+			ltAddr := ltPort.Address()
+			outDDP := ddp.ExtPacket{
+				ExtHeader: ddp.ExtHeader{
+					Size:      atalk.DDPExtHeaderSize + uint16(len(nbpRaw)),
+					Cksum:     0,
+					SrcNet:    ltAddr.Network,
+					SrcNode:   ltAddr.Node,
+					SrcSocket: 2,
+					DstNet:    0,
+					DstNode:   0xFF,
+					DstSocket: 2,
+					Proto:     ddp.ProtoNBP,
+				},
+				Data: nbpRaw,
+			}
+
+			port.logger.Debug("NBP: broadcasting LkUp to LocalTalk", "tuple", tuple)
+			if err := ltPort.Broadcast(&outDDP); err != nil {
+				return err
+			}
+
+			// Also reply if the LocalTalk port matches
+			outDDP2, err := ltPort.helloWorldThisIsMe(nbpkt.NBPID, tuple)
+			if err != nil {
+				return err
+			}
+			if outDDP2 != nil {
+				port.logger.Debug("NBP: LocalTalk port replying to BrRq directly")
+				if err := port.router.Output(ctx, outDDP2); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+
 		// The zone table row is *not* for a local network.
 		// Translate it into a FwdReq and route that to the routers that do have
 		// that zone as a local network.
@@ -168,39 +211,80 @@ func (rtr *Router) handleNBPFwdReq(ctx context.Context, ddpkt *ddp.ExtPacket, nb
 	// There must be 1!
 	tuple := &nbpkt.Tuples[0]
 
+	// Convert to LkUp for broadcasting
+	nbpkt.Function = nbp.FunctionLkUp
+	nbpRaw, err := nbpkt.Marshal()
+	if err != nil {
+		return fmt.Errorf("couldn't marshal LkUp: %v", err)
+	}
+
 	for _, outPort := range rtr.Ports {
 		if !outPort.availableZones.Contains(tuple.Zone) {
 			continue
 		}
-		rtr.Logger.Debug("NBP: Converting FwdReq to LkUp", "tuple", tuple)
-
-		// Convert it to a LkUp and broadcast on the corresponding port
-		nbpkt.Function = nbp.FunctionLkUp
-		nbpRaw, err := nbpkt.Marshal()
-		if err != nil {
-			return fmt.Errorf("couldn't marshal LkUp: %v", err)
-		}
+		rtr.Logger.Debug("NBP: Converting FwdReq to LkUp for EtherTalk", "tuple", tuple)
 
 		// Inside AppleTalk SE, pp 8-20:
 		// "If the destination network is extended, however, the router must also
 		// change the destination network number to $0000, so that the packet is
 		// received by all nodes on the network (within the correct zone multicast
 		// address)."
-		ddpkt.DstNet = 0x0000
-		ddpkt.DstNode = 0xFF // Broadcast node address within the dest network
-		ddpkt.Data = nbpRaw
+		lkUpDDP := *ddpkt
+		lkUpDDP.DstNet = 0x0000
+		lkUpDDP.DstNode = 0xFF
+		lkUpDDP.Data = nbpRaw
 
-		if err := outPort.ZoneMulticast(tuple.Zone, ddpkt); err != nil {
+		if err := outPort.ZoneMulticast(tuple.Zone, &lkUpDDP); err != nil {
 			return err
 		}
 
 		// But also... if it matches us, reply directly with a LkUp-Reply of our own
 		outDDP, err := outPort.helloWorldThisIsMe(nbpkt.NBPID, tuple)
-		if err != nil || outDDP == nil {
+		if err != nil {
 			return err
 		}
-		if err := rtr.Output(ctx, outDDP); err != nil {
+		if outDDP != nil {
+			if err := rtr.Output(ctx, outDDP); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, ltPort := range rtr.LocalTalkPorts {
+		if ltPort.zoneName != tuple.Zone {
+			continue
+		}
+		rtr.Logger.Debug("NBP: Converting FwdReq to LkUp for LocalTalk", "tuple", tuple)
+
+		ltAddr := ltPort.Address()
+		lkUpDDP := ddp.ExtPacket{
+			ExtHeader: ddp.ExtHeader{
+				Size:      atalk.DDPExtHeaderSize + uint16(len(nbpRaw)),
+				Cksum:     0,
+				SrcNet:    ltAddr.Network,
+				SrcNode:   ltAddr.Node,
+				SrcSocket: 2,
+				DstNet:    0,
+				DstNode:   0xFF,
+				DstSocket: 2,
+				Proto:     ddp.ProtoNBP,
+			},
+			Data: nbpRaw,
+		}
+
+		if err := ltPort.Broadcast(&lkUpDDP); err != nil {
 			return err
+		}
+
+		// Reply if we match
+		outDDP, err := ltPort.helloWorldThisIsMe(nbpkt.NBPID, tuple)
+		if err != nil {
+			return err
+		}
+		if outDDP != nil {
+			if err := rtr.Output(ctx, outDDP); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
