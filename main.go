@@ -181,9 +181,31 @@ func main() {
 			myHWAddr = ethernet.Addr(netHWAddr)
 		}
 
-		handle, err := pcap.OpenLive(etcfg.Device, 4096, true, 100*time.Millisecond)
+		inactive, err := pcap.NewInactiveHandle(etcfg.Device)
 		if err != nil {
-			logger.Error("Couldn't open device for packet capture", "device", etcfg.Device, "error", err)
+			logger.Error("Couldn't create inactive pcap handle", "device", etcfg.Device, "error", err)
+			os.Exit(1)
+		}
+		if err := inactive.SetSnapLen(4096); err != nil {
+			logger.Error("Couldn't set snap length", "error", err)
+			os.Exit(1)
+		}
+		if err := inactive.SetPromisc(true); err != nil {
+			logger.Error("Couldn't set promiscuous mode", "error", err)
+			os.Exit(1)
+		}
+		if err := inactive.SetTimeout(1 * time.Millisecond); err != nil {
+			logger.Error("Couldn't set pcap timeout", "error", err)
+			os.Exit(1)
+		}
+		if err := inactive.SetImmediateMode(true); err != nil {
+			logger.Error("Couldn't set immediate mode", "error", err)
+			os.Exit(1)
+		}
+		handle, err := inactive.Activate()
+		if err != nil {
+			inactive.CleanUp()
+			logger.Error("Couldn't activate pcap handle", "device", etcfg.Device, "error", err)
 			os.Exit(1)
 		}
 		bpfFilter := fmt.Sprintf("(atalk or aarp) and (ether multicast or ether dst %s)", myHWAddr)
